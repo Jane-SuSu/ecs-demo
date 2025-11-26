@@ -1,0 +1,30 @@
+version: '3'
+
+services:
+  hello-service:
+    image: xxx.dkr.ecr.ap-northeast-1.amazonaws.com/ecs-demo/hello:20251117001659
+    platform: linux/amd64
+    container_name: hello-service
+    ports:
+      - "5000:5000"
+    environment:
+      - WORLD_SERVICE_URL=http://world-service:5001/
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  world-service:
+    image: xxx.dkr.ecr.ap-northeast-1.amazonaws.com/ecs-demo/world:20251117100252
+    platform: linux/amd64
+    container_name: world-service
+    ports:
+      - "5001:5001"
+    environment:
+      - HELLO_SERVICE_URL=http://hello-service:5000/
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge

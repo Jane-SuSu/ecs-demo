@@ -1,0 +1,38 @@
+version: '3'
+
+services:
+  hello-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.hello
+    container_name: hello-service
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./hello_app.py:/app/app.py
+    command: python app.py
+    environment:
+      - WORLD_SERVICE_URL=http://world-service:5001/
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  world-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.world
+    container_name: world-service
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./world_app.py:/app/app.py
+    command: python app.py
+    environment:
+      - HELLO_SERVICE_URL=http://hello-service:5000/
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge

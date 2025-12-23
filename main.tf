@@ -101,12 +101,14 @@ module "alb" {
    backend_port     = 5000
    backend_protocol = "HTTP"
    target_type      = "ip"
+   host_header      = ["hello-service"]
   },
   {
    name             = "world-tg"
    backend_port     = 5001
    backend_protocol = "HTTP"
    target_type      = "ip"
+   host_header      = ["world-service"]
   }
  ]
 }
@@ -242,9 +244,17 @@ resource "docker_registry_image" "worldimage" {
 }
 
 # 5. 建 Task Definition
+
+# --- 1. Execution Role (基礎設施用：拉 Image, 寫 Log) ---
 resource "aws_iam_role" "ecsTaskExecutionRole" {
   name               = "ecsTaskExecutionRole"
-  assume_role_policy = "${data.aws_iam_policy_document.assume_role_policy.json}"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_policy.json
+}
+
+# 確保 log group 存在 (避免 ResourceInitializationError)
+resource "aws_cloudwatch_log_group" "ecs_otel_sidecar" {
+  name              = "/ecs/ecs-aws-otel-sidecar-collector"
+  retention_in_days = 7
 }
 
 data "aws_iam_policy_document" "assume_role_policy" {
@@ -259,32 +269,67 @@ data "aws_iam_policy_document" "assume_role_policy" {
 }
 
 resource "aws_iam_role_policy_attachment" "ecsTaskExecutionRole_policy" {
-  role       = "${aws_iam_role.ecsTaskExecutionRole.name}"
+  role       = aws_iam_role.ecsTaskExecutionRole.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# --- 2. Task Role (應用程式用：寫 X-Ray, 存取 S3 等) ---
+resource "aws_iam_role" "ecsTaskRole" {
+  name = "ecsTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_policy.json
+}
+
+# 賦予 X-Ray 寫入權限
+resource "aws_iam_role_policy_attachment" "ecsTaskRole_xray" {
+  role       = aws_iam_role.ecsTaskRole.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+}
+
+
 ## hello task
 resource "aws_ecs_task_definition" "hello" {
-  container_definitions = jsonencode([{
-    essential = true,
-    image = resource.docker_registry_image.helloimage.name,
-    name = "hello-container",
-    portMappings = [{
-      containerPort = 5000,
-      hostPort = 5000,
-      name = "hello-tcp",
-      protocol = "tcp",
-      appProtocol = "http"
-    }],
-    environment = [
-      {
-        name = "WORLD_SERVICE_URL",
-        value = "http://world-service:5001"
+  container_definitions = jsonencode([
+    {
+      essential = true,
+      image = resource.docker_registry_image.helloimage.name,
+      name = "hello-container",
+      portMappings = [{
+        containerPort = 5000,
+        hostPort = 5000,
+        name = "hello-tcp",
+        protocol = "tcp",
+        appProtocol = "http"
+      }],
+      # 讓 App 知道 OTEL 要送去哪
+      environment = [
+        { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://localhost:4317" },
+        { name = "WORLD_SERVICE_URL", value = "http://world-service:5001" }
+      ]
+    },
+    {
+      # --- ADOT Sidecar ---
+      name      = "aws-otel-collector"
+      image     = "public.ecr.aws/aws-observability/aws-otel-collector:latest"
+      essential = true
+      # 使用 AWS 預設的 config，它會把 OTLP 轉成 X-Ray 格式
+      command   = ["--config=/etc/ecs/ecs-default-config.yaml"]
+      portMappings = []
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs_otel_sidecar.name
+          "awslogs-region"        = "ap-northeast-1"
+          "awslogs-stream-prefix" = "ecs"
+          # 移除 awslogs-create-group，因為我們已經用 Terraform 建好了，避免權限不足
+        }
       }
-    ]
-  }])
+    }
+  ])
+
   cpu = 256
-  execution_role_arn = "${aws_iam_role.ecsTaskExecutionRole.arn}"
+  execution_role_arn = aws_iam_role.ecsTaskExecutionRole.arn
+  task_role_arn      = aws_iam_role.ecsTaskRole.arn
+
   family = "tf-demo-example-tasks-hello"
   memory = 512
   network_mode = "awsvpc"
@@ -299,32 +344,50 @@ resource "aws_ecs_task_definition" "hello" {
 
 ## world task
 resource "aws_ecs_task_definition" "world" {
-  container_definitions = jsonencode([{
-    essential = true,
-    image = resource.docker_registry_image.worldimage.name,
-    name = "world-container",
-    portMappings = [{
-      containerPort = 5001,
-      hostPort = 5001,
-      name = "world-tcp",
-      protocol = "tcp",
-      appProtocol = "http"
-    }],
-    environment = [
-      {
-        name = "HELLO_SERVICE_URL",
-        value = "http://hello-service:5000"
+  container_definitions = jsonencode([
+    {
+      essential = true,
+      image = resource.docker_registry_image.worldimage.name,
+      name = "world-container",
+      portMappings = [{
+        containerPort = 5001,
+        hostPort = 5001,
+        name = "world-tcp",
+        protocol = "tcp",
+        appProtocol = "http"
+      }],
+      environment = [
+        { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://localhost:4317" },
+        { name = "HELLO_SERVICE_URL", value = "http://hello-service:5000" }
+      ]
+    },
+    {
+      # --- ADOT Sidecar ---
+      name      = "aws-otel-collector"
+      image     = "public.ecr.aws/aws-observability/aws-otel-collector:latest"
+      essential = true
+      command   = ["--config=/etc/ecs/ecs-default-config.yaml"]
+      portMappings = []
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs_otel_sidecar.name
+          "awslogs-region"        = "ap-northeast-1"
+          "awslogs-stream-prefix" = "ecs"
+        }
       }
-    ]
-  }])
+    }
+  ])
+
   cpu = 256
-  execution_role_arn = "${aws_iam_role.ecsTaskExecutionRole.arn}"
+  execution_role_arn = aws_iam_role.ecsTaskExecutionRole.arn
+  task_role_arn      = aws_iam_role.ecsTaskRole.arn
+
   family = "tf-demo-example-tasks-world"
   memory = 512
   network_mode = "awsvpc"
   requires_compatibilities = ["FARGATE"]
 
-  # Only set the below if building on an ARM64 computer like an Apple Silicon Mac
   runtime_platform {
     operating_system_family = "LINUX"
     cpu_architecture        = "X86_64"
